@@ -190,8 +190,11 @@ class CriticNetwork(nn.Module):
         )
 
         """
-        Il Learning Rate alpha è lo stesso per entrambe le reti:
-            
+        Il Learning Rate alpha è lo stesso per entrambe le reti, generalmente viene dato
+        un learning rate più alto a al Critic e uno più basso all'Actor, trattandosi di un
+        problema di regressione, vogliamo che il Critic impari velocemente a mappare gli stati
+        i loro valori reali, L'Actor invece preferisce essere più conservativo essendo la policy
+        un tradeoff delicato.
         """
         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
         if T.cuda.is_available():
@@ -202,3 +205,12 @@ class CriticNetwork(nn.Module):
             self.device = T.device('cpu')
         self.to(self.device)
 
+    def forward(self, state):
+        value = self.critic(state)
+        return value
+    
+    def save_checkpoint(self):
+        T.save(self.state_dict(), self.checkpoint_file)
+
+    def load_checkpoint(self):
+        self.load_state_dict(T.load(self.checkpoint_file))
