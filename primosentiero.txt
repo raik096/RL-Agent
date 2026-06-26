@@ -1,0 +1,481 @@
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_ataripy
+import os
+import random
+import time
+from dataclasses import dataclass
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import tyro
+from torch.distributions.categorical import Categorical
+from torch.utils.tensorboard import SummaryWriter
+
+from utils.atari_wrappers import (  # isort:skip
+    ClipRewardEnv,
+    EpisodicLifeEnv,
+    FireResetEnv,
+    MaxAndSkipEnv,
+    NoopResetEnv,
+)
+
+
+import os
+from dataclasses import dataclass
+
+@dataclass
+class Args:
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    """the name of this experiment"""
+    seed: int = 1
+    """seed of the experiment"""
+    torch_deterministic: bool = True
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "cleanRL"
+    """the wandb's project name"""
+    wandb_entity: str = None
+    """the entity (team) of wandb's project"""
+    capture_video: bool = True
+    """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = True
+    """whether to save the model weights"""
+    model_path: str = ""
+    """the path to a saved model state dict to load"""
+    eval: bool = False
+    """if True, runs the model in evaluation mode and exits"""
+
+    # Algorithm specific arguments
+    env_id: str = "BreakoutNoFrameskip-v4"
+    """the id of the environment"""
+    
+    total_timesteps: int = 10000000
+    """total timesteps of the experiments.
+    - AUMENTARE: Più tempo per esplorare e perfezionare la policy. Maggiore costo computazionale.
+    - DIMINUIRE: Addestramento più rapido, ma rischio di terminare prima di convergere a una policy ottimale."""
+    
+    learning_rate: float = 2.5e-4
+    """the learning rate of the optimizer.
+    - AUMENTARE: Accelerazione iniziale, ma alto rischio di saltare i minimi ottimali o distruggere la policy.
+    - DIMINUIRE: Apprendimento più stabile ma molto lento. Maggior rischio di incastrarsi in minimi locali."""
+    
+    num_envs: int = 8
+    """the number of parallel game environments.
+    - AUMENTARE: Riduce la varianza raccogliendo dati più decorrelati (maggiore stabilità), ma gli update sono meno frequenti.
+    - DIMINUIRE: Aggiornamenti più veloci e frequenti, ma con un gradiente molto più rumoroso e instabile."""
+    
+    num_steps: int = 128
+    """the number of steps to run in each environment per policy rollout.
+    - AUMENTARE: Raccoglie batch più grandi prima dell'update (riduce la varianza). Apprendimento iniziale più lento.
+    - DIMINUIRE: Update più veloci, ma la stima del vantaggio si baserà su orizzonti temporali più corti e rumorosi."""
+    
+    anneal_lr: bool = True
+    """Toggle learning rate annealing for policy and value networks"""
+    
+    gamma: float = 0.99
+    """the discount factor gamma.
+    - AUMENTARE (verso 1): L'agente valuta molto le ricompense a lungo termine. Ideale per la strategia, ma alta varianza.
+    - DIMINUIRE (verso 0): L'agente diventa "miope" (focus sul breve termine). Bassa varianza, ma policy spesso sub-ottimale."""
+    
+    gae_lambda: float = 0.95
+    """the lambda for the general advantage estimation.
+    - AUMENTARE (verso 1): Minor bias ma alta varianza (si affida di più ai rendimenti reali stile Monte Carlo).
+    - DIMINUIRE (verso 0): Minor varianza ma alto bias (si affida di più alla predizione a 1-step del Critic)."""
+    
+    num_minibatches: int = 4
+    """the number of mini-batches"""
+    
+    update_epochs: int = 4
+    """the K epochs to update the policy.
+    - AUMENTARE: Estrae più informazioni dal batch corrente. Troppo alto causa severo overfitting e collasso della policy.
+    - DIMINUIRE: Mantiene i gradienti "freschi" evitando overfitting, ma richiede molti più step nell'ambiente per imparare."""
+    
+    norm_adv: bool = True
+    """Toggles advantages normalization"""
+    
+    clip_coef: float = 0.1
+    """the surrogate clipping coefficient.
+    - AUMENTARE: Permette update della policy più larghi e veloci, ma con altissimo rischio di "catastrophic overstepping".
+    - DIMINUIRE: Estrema stabilità costringendo la policy a cambiare pochissimo per volta, ma rallenta enormemente il training."""
+    
+    clip_vloss: bool = True
+    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
+    
+    ent_coef: float = 0.01
+    """coefficient of the entropy.
+    - AUMENTARE: Mantiene la policy stocastica forzando l'esplorazione continua. Troppo alto: l'agente gioca a caso.
+    - DIMINUIRE: Fa convergere velocemente l'agente sulle azioni preferite. Troppo basso: smette di esplorare troppo presto."""
+    
+    vf_coef: float = 0.5
+    """coefficient of the value function.
+    - AUMENTARE: Dà più priorità all'addestramento del Critic. Può destabilizzare l'Actor se condividono la rete base.
+    - DIMINUIRE: Priorità all'Actor, ma se il Critic non impara bene, il calcolo del Vantaggio (e dell'Actor) sarà errato."""
+    
+    max_grad_norm: float = 0.5
+    """the maximum norm for the gradient clipping.
+    - AUMENTARE: Rischio di step di ottimizzazione enormi se i gradienti esplodono (instabilità numerica).
+    - DIMINUIRE: Appiattisce i gradienti, garantendo stabilità ma rallentando l'apprendimento dove la loss è molto ripida."""
+    
+    target_kl: float = None
+    """the target KL divergence threshold.
+    - AUMENTARE: Consente variazioni più aggressive della policy prima di fermare l'addestramento dell'epoca in corso.
+    - DIMINUIRE: Comportamento molto conservativo; blocca l'epoca per modifiche minime, prevenendo qualsiasi strappo."""
+
+    # to be filled in runtime
+    batch_size: int = 0
+    """the batch size (computed in runtime)"""
+    minibatch_size: int = 0
+    """the mini-batch size (computed in runtime)"""
+    num_iterations: int = 0
+    """the number of iterations (computed in runtime)"""
+
+
+
+###### Funzione factory per creare l'ambiente in gioco 
+###### COME L'AGENTE DEVE APPRENDERE
+def make_env(env_id, idx, capture_video, run_name):
+    def thunk():
+        if capture_video and idx == 0:
+            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+
+        # I giochi atari, la maggior parte sono puramente deterministici, per evitare
+        # che l'agente impari a memoria una singola traiettoria tau, all'inizio di ogni 
+        # episodio vengono eseguiti un numero casuale di azioni (fino a 30) mettendo
+        # stocasticità nello stato s1 iniziale
+        env = NoopResetEnv(env, noop_max=30)
+
+        # Questo warp esegue l'azione scelta dall'agente per 4 frame 
+        # consecutivi, l'agente quindi prende decisioni che durano 4 frame,
+        # velocizzando l'addestramento, inoltre prende il valore massimo dei 
+        # pixel in modo da evitare il problema dello sfarfallio
+        env = MaxAndSkipEnv(env, skip=4)
+
+        # Questo warp dice all'ambiente di trattare la perdita di una vita come la fine 
+        # di un episodio e premono automaticamente il pulsante 'FIRE' in modo da avviare
+        # in automatico un azione propedeutica
+        env = EpisodicLifeEnv(env)
+        if "FIRE" in env.unwrapped.get_action_meanings():
+            env = FireResetEnv(env)
+
+        # In questo warp diversi giochi assegnano punteggi diversi
+        # in questo modo si riduce la varianza dei punteggi in contesti
+        # di ambienti multipli, clippano a +1 e -1 
+        env = ClipRewardEnv(env)
+
+        # In questo warp si fa la resize dei frame originali del gioco
+        # in modo da ridurre il costo computazionale, sia in termini di 
+        # risoluzione e sia in termini di combinazione rgb, portandolo ad un
+        # solo canale.
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayScaleObservation(env)
+
+        # In questo wrap si inserisce all'interno dell'ambiente lo stack
+        # degli ultimi 4 frame per aumentare l'approssimazione dello stato 
+        # su fattori non rilevabili con un frame, come la velocità
+        env = gym.wrappers.FrameStack(env, 4)
+        return env
+
+    return thunk
+
+###### INIZIALIZZAZIONE DELL'AGENTE
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+
+    # Iniazializzazione ortogonale dei pesi in modo che la matrice
+    # preservi la norma dei vettori di input senza stabilizzando il flusso 
+    # in forward e in backward
+    torch.nn.init.orthogonal_(layer.weight, std)
+    # I bias vengono inizializzati a 0
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+
+class Agent(nn.Module):
+    def __init__(self, envs):
+        super().__init__()
+
+        # L'agente elabora gli stati s_t tramite una CNN, adottando in questo caso
+        # tre layer convoluzionali con kernel 8x8, 4x4, 3x3 seguiti da una NN densa a 512 neuroni
+        # [ architettura classica introdotta per le Deep Q-Networks ]
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
+            nn.ReLU(),
+        )
+        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(512, 1), std=1)
+
+    def get_value(self, x):
+        # ritorno una normalizzazione dell'input x per evitare valori troppo
+        # grandi che saturano le funzioni di attivazione
+        return self.critic(self.network(x / 255.0))
+
+    def get_action_and_value(self, x, action=None):
+        # Vengono utilizzati due modelli che nella parte di estrazione di FEATURE
+        # quindi la parte "backbone" della rete condividono i pesi.
+        # L'ACTOR che deve calcolare la policy pi(action_t|stato_t, theta)
+        # Il CRITIC che stima la funzione di valore dello stato v(state_t, )
+        # Condividere la stessa rete convoluzionale permette ai gradienti di entrambi
+        # i compiti di cooperare per costruire un estrattore di feature migliore e più velocemente
+        hidden = self.network(x / 255.0)
+        logits = self.actor(hidden)
+        probs = Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+
+
+if __name__ == "__main__":
+    # Si leggono i parametri passati da riga di comando
+    args = tyro.cli(Args)
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    args.num_iterations = args.total_timesteps // args.batch_size
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    if args.track:
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
+
+    # TRY NOT TO MODIFY: seeding 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
+
+    if torch.cuda.is_available() and args.cuda:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available() and args.cuda:
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    # env setup, dove l'agente gioca a più partite contemporaneamente
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+    )
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+
+    agent = Agent(envs).to(device)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    if args.model_path:
+        agent.load_state_dict(torch.load(args.model_path, map_location=device))
+        print(f"Modello caricato con successo da {args.model_path}!")
+
+    if args.eval:
+        agent.eval()
+        print("Avvio della modalità di valutazione (evaluation mode)...")
+        next_obs, _ = envs.reset(seed=args.seed)
+        next_obs = torch.Tensor(next_obs).to(device)
+        episodic_returns = []
+        while len(episodic_returns) < 10:
+            with torch.no_grad():
+                action, _, _, _ = agent.get_action_and_value(next_obs)
+            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_obs = torch.Tensor(next_obs).to(device)
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        ret = info['episode']['r']
+                        if hasattr(ret, "item"):
+                            ret = ret.item()
+                        elif isinstance(ret, (list, np.ndarray)):
+                            ret = ret[0]
+                        print(f"Episodio di valutazione completato: return={ret}")
+                        episodic_returns.append(ret)
+        print(f"Valutazione completata. Return medio su {len(episodic_returns)} episodi: {np.mean(episodic_returns)}")
+        envs.close()
+        writer.close()
+        import sys
+        sys.exit(0)
+
+    # ALGO Logic: Storage setup
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+
+    # TRY NOT TO MODIFY: start the game
+    global_step = 0
+    start_time = time.time()
+    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = torch.Tensor(next_obs).to(device)
+    next_done = torch.zeros(args.num_envs).to(device)
+    best_episodic_return = -float("inf")
+
+    for iteration in range(1, args.num_iterations + 1):
+        # Annealing the rate if instructed to do so.
+        if args.anneal_lr:
+            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            lrnow = frac * args.learning_rate
+            optimizer.param_groups[0]["lr"] = lrnow
+
+        for step in range(0, args.num_steps):
+            global_step += args.num_envs
+            obs[step] = next_obs
+            dones[step] = next_done
+
+            # ALGO LOGIC: action logic
+            with torch.no_grad():
+                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                values[step] = value.flatten()
+            actions[step] = action
+            logprobs[step] = logprob
+
+            # TRY NOT TO MODIFY: execute the game and log data.
+            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_done = np.logical_or(terminations, truncations)
+            rewards[step] = torch.tensor(reward, dtype=torch.float32).to(device).view(-1)
+            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        ret = info['episode']['r']
+                        if hasattr(ret, "item"):
+                            ret = ret.item()
+                        elif isinstance(ret, (list, np.ndarray)):
+                            ret = ret[0]
+                        print(f"global_step={global_step}, episodic_return={ret}")
+                        writer.add_scalar("charts/episodic_return", ret, global_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                        
+                        # Salvataggio del modello migliore
+                        if args.save_model and ret > best_episodic_return:
+                            best_episodic_return = ret
+                            os.makedirs(f"runs/{run_name}", exist_ok=True)
+                            torch.save(agent.state_dict(), f"runs/{run_name}/best_model.pt")
+                            print(f"Nuovo record! Modello salvato in runs/{run_name}/best_model.pt con return: {best_episodic_return}")
+
+        # bootstrap value if not done
+        with torch.no_grad():
+            next_value = agent.get_value(next_obs).reshape(1, -1)
+            advantages = torch.zeros_like(rewards).to(device)
+            lastgaelam = 0
+            for t in reversed(range(args.num_steps)):
+                if t == args.num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextvalues = values[t + 1]
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            returns = advantages + values
+
+        # flatten the batch
+        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_logprobs = logprobs.reshape(-1)
+        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
+
+        # Optimizing the policy and value network
+        b_inds = np.arange(args.batch_size)
+        clipfracs = []
+        for epoch in range(args.update_epochs):
+            np.random.shuffle(b_inds)
+            for start in range(0, args.batch_size, args.minibatch_size):
+                end = start + args.minibatch_size
+                mb_inds = b_inds[start:end]
+
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                logratio = newlogprob - b_logprobs[mb_inds]
+                ratio = logratio.exp()
+
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                mb_advantages = b_advantages[mb_inds]
+                if args.norm_adv:
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+                # Policy loss
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # Value loss
+                newvalue = newvalue.view(-1)
+                if args.clip_vloss:
+                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                    v_clipped = b_values[mb_inds] + torch.clamp(
+                        newvalue - b_values[mb_inds],
+                        -args.clip_coef,
+                        args.clip_coef,
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+                entropy_loss = entropy.mean()
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
+
+            if args.target_kl is not None and approx_kl > args.target_kl:
+                break
+
+        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        var_y = np.var(y_true)
+        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        print("SPS:", int(global_step / (time.time() - start_time)))
+        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.save_model:
+        os.makedirs(f"runs/{run_name}", exist_ok=True)
+        torch.save(agent.state_dict(), f"runs/{run_name}/final_model.pt")
+        print(f"Modello finale salvato in runs/{run_name}/final_model.pt")
+
+    envs.close()
+    writer.close()
