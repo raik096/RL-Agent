@@ -1,7 +1,8 @@
 import gymnasium as gym
 import numpy as np
-from ppo_torch import Agent
+from pong.ppo_torch import Agent
 from utils import plot_learning_curve
+import os
 
 if __name__ == '__main__':
     # CORREZIONE 1: Aggiornato a v1 per togliere il warning
@@ -14,8 +15,9 @@ if __name__ == '__main__':
     agent = Agent(n_actions=env.action_space.n, batch_size=batch_size, 
                     alpha=alpha, n_epochs=n_epochs, 
                     input_dims=env.observation_space.shape)
-    n_games = 300
+    n_games = 600
 
+    os.makedirs('plots', exist_ok=True)
     figure_file = 'plots/cartpole.png'
 
     best_score = -np.inf

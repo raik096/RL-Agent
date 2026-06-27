@@ -138,6 +138,8 @@ class ActorNetwork(nn.Module):
             fc1_dims=256, fc2_dims=256, chkpt_dir='tmp/ppo'):
         super(ActorNetwork, self).__init__()
 
+        os.makedirs(chkpt_dir, exist_ok=True)
+
         self.checkpoint_file = os.path.join(chkpt_dir, 'actor_torch_ppo')
         self.actor = nn.Sequential(
                 nn.Linear(*input_dims, fc1_dims),
@@ -168,6 +170,8 @@ class CriticNetwork(nn.Module):
     def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256,
             chkpt_dir='tmp/ppo'):
         super(CriticNetwork, self).__init__()
+
+        os.makedirs(chkpt_dir, exist_ok=True)
 
         self.checkpoint_file = os.path.join(chkpt_dir, 'critic_torch_ppo')
         self.critic = nn.Sequential(
@@ -219,7 +223,7 @@ class Agent:
         self.critic.load_checkpoint()
 
     def choose_action(self, observation):
-        state = T.tensor([observation], dtype=T.float).to(self.actor.device)
+        state = T.tensor(np.array([observation]), dtype=T.float).to(self.actor.device)
 
         dist = self.actor(state)
         value = self.critic(state)
