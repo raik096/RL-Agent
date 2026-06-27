@@ -1,7 +1,7 @@
 import gymnasium as gym
 import torch as T
 import time
-from pong.ppo_torch import Agent
+from ppo_torch import Agent
 
 
 
