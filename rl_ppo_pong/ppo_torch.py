@@ -81,6 +81,27 @@ La memoria verrà bloccata a T passi, diciamo 20, e terremo traccia degli:
 
 I batches vengono pescati randomicamente da un bacino di batch e verranno 
 aggiornati ogni 4 epoche
+
+
+HINT: 
+immaginarsi le dimensioni dei tensori: 
+    
+    0D (Scalare): Un singolo punto.
+
+    1D (Vettore): Una linea di punti.
+
+    2D (Matrice): Un quadrato di punti.
+
+    3D (Tensore): Un cubo di punti.
+
+    4D: Una linea di cubi.
+
+    5D: Un quadrato di cubi.
+
+    6D: Un cubo di cubi.
+
+    7D: Una linea di cubi di cubi... e così via!
+
 """
 
 
@@ -141,12 +162,30 @@ class ActorNetwork(nn.Module):
         os.makedirs(chkpt_dir, exist_ok=True)
 
         self.checkpoint_file = os.path.join(chkpt_dir, 'actor_torch_ppo')
+        
+        # A differenza del primo try, la rete deve gestire il leggere i frame
+        # dal gioco di un numero sufficiente a tirare fuori la feature della 
+        # velocità, ad ogni layer la dimensione spaziale dell'immagine si calcola
+        # O = [ (Input - KernelSize + 2*Padding) / Stride ] + 1
+        # L'input (4, 84, 84) quindi di 4 frame ognuno grande 84x84 e vengono lette
+        # dal kernel che ha profondità n (n = numero di frame), e vedendoli
+        # contemporaneamente fa una sommatoria che somma anche sulla profondità
+        self.conv = nn.Sequential(
+            # Restituisce 32 feature di dimensioni la form. sopra
+            nn.Conv2d(input_dims[0], 32, kernel_size=8, stride=4), # output dim = [32, 20, 20]
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), # output dim = [64, 9, 9]
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), # output dim = [64, 7, 7]
+            nn.ReLU(),
+            nn.Flatten() # 64 x 7 x 7 = 3136
+        )
+
+        # Il primo layer prende 
         self.actor = nn.Sequential(
-                nn.Linear(*input_dims, fc1_dims),
+                nn.Linear(3136, 512),
                 nn.ReLU(),
-                nn.Linear(fc1_dims, fc2_dims),
-                nn.ReLU(),
-                nn.Linear(fc2_dims, n_actions),
+                nn.Linear(512, n_actions),
                 nn.Softmax(dim=-1)
         )
 
@@ -155,7 +194,10 @@ class ActorNetwork(nn.Module):
         self.to(self.device)
 
     def forward(self, state):
-        dist = self.actor(state)
+        x = state / 255.0
+        x = self.conv(x)
+        dist = self.actor(x)
+
         dist = Categorical(dist)
         
         return dist
@@ -172,14 +214,22 @@ class CriticNetwork(nn.Module):
         super(CriticNetwork, self).__init__()
 
         os.makedirs(chkpt_dir, exist_ok=True)
-
         self.checkpoint_file = os.path.join(chkpt_dir, 'critic_torch_ppo')
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_dims[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+
         self.critic = nn.Sequential(
-                nn.Linear(*input_dims, fc1_dims),
-                nn.ReLU(),
-                nn.Linear(fc1_dims, fc2_dims),
-                nn.ReLU(),
-                nn.Linear(fc2_dims, 1)
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
         )
 
         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
@@ -187,8 +237,9 @@ class CriticNetwork(nn.Module):
         self.to(self.device)
 
     def forward(self, state):
-        value = self.critic(state)
-
+        x = state / 255.0
+        x = self.conv(x)
+        value = self.critic(x)
         return value
 
     def save_checkpoint(self):

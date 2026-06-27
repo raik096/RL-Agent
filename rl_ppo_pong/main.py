@@ -1,24 +1,36 @@
 import gymnasium as gym
 import numpy as np
-from pong.ppo_torch import Agent
+from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
+import ale_py
+
+from ppo_torch import Agent
 from utils import plot_learning_curve
 import os
 
+gym.register_envs(ale_py)
+
 if __name__ == '__main__':
-    # CORREZIONE 1: Aggiornato a v1 per togliere il warning
-    env = gym.make('CartPole-v1')
-    N = 20
-    batch_size = 5
-    n_epochs = 4
-    alpha = 0.0003
+
+    env = gym.make('ALE/Pong-v5', frameskip=1)
+
+    # Riduzione a 84x84 in bianco e nero e saltiamo i frame 
+    env = AtariPreprocessing(env, screen_size=84, grayscale_obs=True, 
+                             frame_skip=4, scale_obs=False)
+    
+    env = FrameStackObservation(env, 4)
+
+    N = 2048        
+    batch_size = 64
+    n_epochs = 10
+    alpha = 0.00025  
     
     agent = Agent(n_actions=env.action_space.n, batch_size=batch_size, 
                     alpha=alpha, n_epochs=n_epochs, 
                     input_dims=env.observation_space.shape)
-    n_games = 600
+    n_games = 10
 
     os.makedirs('plots', exist_ok=True)
-    figure_file = 'plots/cartpole.png'
+    figure_file = 'plots/pong.png'
 
     best_score = -np.inf
     score_history = []
